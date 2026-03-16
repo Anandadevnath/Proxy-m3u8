@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 
 const app = new Hono();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8000;
 
 function isAllowedTarget(targetUrl) {
   try {
@@ -63,30 +63,47 @@ function rewriteM3U8(text, baseUrl, req) {
     .join("\n");
 }
 
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "*",
+  "Access-Control-Max-Age": "86400",
+};
+
+// Handle OPTIONS preflight for /hls
+app.options("/hls", (c) => {
+  return c.text("", 204, corsHeaders);
+});
+
+// Handle OPTIONS preflight for everything else
+app.options("*", (c) => {
+  return c.text("", 204, corsHeaders);
+});
+
 app.get("/", (c) => c.text("Proxy is running"));
 
 app.get("/hls", async (c) => {
   const src = c.req.query("src");
 
   if (!src || typeof src !== "string") {
-    return c.text("Missing src", 400);
+    return c.text("Missing src", 400, corsHeaders);
   }
 
   if (!isAllowedTarget(src)) {
-    return c.text("Invalid or disallowed URL", 403);
+    return c.text("Invalid or disallowed URL", 403, corsHeaders);
   }
 
   let target;
   try {
     target = new URL(src);
   } catch {
-    return c.text("Invalid URL", 400);
+    return c.text("Invalid URL", 400, corsHeaders);
   }
 
   const pathname = target.pathname;
 
   if (!isPlaylist(pathname) && !isSegmentLike(pathname)) {
-    return c.text("Unsupported media type", 400);
+    return c.text("Unsupported media type", 400, corsHeaders);
   }
 
   try {
@@ -98,12 +115,14 @@ app.get("/hls", async (c) => {
       signal: AbortSignal.timeout(15000),
     });
 
-    if (!upstream.ok && (upstream.status < 200 || upstream.status >= 300)) {
-      return c.text("Upstream error", upstream.status);
+    if (!upstream.ok) {
+      return c.text("Upstream error", upstream.status, corsHeaders);
     }
 
     const headers = new Headers();
     headers.set("Access-Control-Allow-Origin", "*");
+    headers.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+    headers.set("Access-Control-Allow-Headers", "*");
     headers.set("Cache-Control", "no-store");
 
     if (isPlaylist(pathname)) {
@@ -131,7 +150,7 @@ app.get("/hls", async (c) => {
     });
   } catch (err) {
     console.error(err.message);
-    return c.text("Proxy failed", 500);
+    return c.text("Proxy failed", 500, corsHeaders);
   }
 });
 
