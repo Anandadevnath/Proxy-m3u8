@@ -52,9 +52,14 @@ function isLikelyMediaPath(pathname) {
   return isPlaylistPath(pathname) || isSegmentLike(pathname);
 }
 
+// Force HTTPS in rewritten playlist URLs
 function makeProxyUrl(c, absoluteUrl) {
-  const requestUrl = new URL(c.req.url);
-  return `${requestUrl.origin}/hls?src=${encodeURIComponent(absoluteUrl)}`;
+  const host =
+    c.req.header("x-forwarded-host") ||
+    c.req.header("host") ||
+    new URL(c.req.url).host;
+
+  return `https://${host}/hls?src=${encodeURIComponent(absoluteUrl)}`;
 }
 
 function rewriteM3U8(text, baseUrl, c) {
@@ -109,7 +114,11 @@ app.options("*", (c) => {
 });
 
 app.get("/", (c) => {
-  return c.text("Proxy is running", 200, withCors({ "Content-Type": "text/plain" }));
+  return c.text(
+    "Proxy is running",
+    200,
+    withCors({ "Content-Type": "text/plain; charset=utf-8" })
+  );
 });
 
 app.head("/", (c) => {
@@ -150,10 +159,7 @@ async function handleProxy(c) {
       "User-Agent",
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     );
-    requestHeaders.set(
-      "Accept",
-      "*/*"
-    );
+    requestHeaders.set("Accept", "*/*");
 
     const incomingRange = c.req.header("range");
     if (incomingRange) requestHeaders.set("Range", incomingRange);
