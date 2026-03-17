@@ -2,7 +2,23 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 
 const app = new Hono();
-const PORT = process.env.PORT || 8000;
+const PORT = Number(process.env.PORT || 8000);
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+  "Access-Control-Allow-Headers": "*",
+  "Access-Control-Expose-Headers":
+    "Content-Length, Content-Range, Content-Type, Accept-Ranges",
+  "Access-Control-Max-Age": "86400",
+};
+
+function withCors(headers = {}) {
+  return {
+    ...CORS_HEADERS,
+    ...headers,
+  };
+}
 
 function isAllowedTarget(targetUrl) {
   try {
@@ -13,7 +29,7 @@ function isAllowedTarget(targetUrl) {
   }
 }
 
-function isPlaylist(pathname) {
+function isPlaylistPath(pathname) {
   return pathname.toLowerCase().endsWith(".m3u8");
 }
 
@@ -23,20 +39,25 @@ function isSegmentLike(pathname) {
     p.endsWith(".ts") ||
     p.endsWith(".m4s") ||
     p.endsWith(".mp4") ||
+    p.endsWith(".m4a") ||
     p.endsWith(".aac") ||
     p.endsWith(".mp3") ||
     p.endsWith(".vtt") ||
+    p.endsWith(".webvtt") ||
     p.endsWith(".key")
   );
 }
 
-function makeProxyUrl(req, absoluteUrl) {
-  const host = req.header("host");
-  const protocol = req.url.startsWith("https") ? "https" : "http";
-  return `${protocol}://${host}/hls?src=${encodeURIComponent(absoluteUrl)}`;
+function isLikelyMediaPath(pathname) {
+  return isPlaylistPath(pathname) || isSegmentLike(pathname);
 }
 
-function rewriteM3U8(text, baseUrl, req) {
+function makeProxyUrl(c, absoluteUrl) {
+  const requestUrl = new URL(c.req.url);
+  return `${requestUrl.origin}/hls?src=${encodeURIComponent(absoluteUrl)}`;
+}
+
+function rewriteM3U8(text, baseUrl, c) {
   const base = new URL(baseUrl);
 
   return text
@@ -48,14 +69,18 @@ function rewriteM3U8(text, baseUrl, req) {
 
       if (trimmed.startsWith("#")) {
         return line.replace(/URI="([^"]+)"/g, (_, uri) => {
-          const abs = new URL(uri, base).toString();
-          return `URI="${makeProxyUrl(req, abs)}"`;
+          try {
+            const abs = new URL(uri, base).toString();
+            return `URI="${makeProxyUrl(c, abs)}"`;
+          } catch {
+            return `URI="${uri}"`;
+          }
         });
       }
 
       try {
         const abs = new URL(trimmed, base).toString();
-        return makeProxyUrl(req, abs);
+        return makeProxyUrl(c, abs);
       } catch {
         return line;
       }
@@ -63,97 +88,173 @@ function rewriteM3U8(text, baseUrl, req) {
     .join("\n");
 }
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, OPTIONS",
-  "Access-Control-Allow-Headers": "*",
-  "Access-Control-Max-Age": "86400",
-};
+function copyHeaderIfPresent(sourceHeaders, targetHeaders, name) {
+  const value = sourceHeaders.get(name);
+  if (value) targetHeaders.set(name, value);
+}
 
-// Handle OPTIONS preflight for /hls
-app.options("/hls", (c) => {
-  return c.text("", 204, corsHeaders);
+app.use("*", async (c, next) => {
+  await next();
+
+  Object.entries(CORS_HEADERS).forEach(([key, value]) => {
+    c.res.headers.set(key, value);
+  });
 });
 
-// Handle OPTIONS preflight for everything else
 app.options("*", (c) => {
-  return c.text("", 204, corsHeaders);
+  return new Response(null, {
+    status: 204,
+    headers: withCors(),
+  });
 });
 
-app.get("/", (c) => c.text("Proxy is running"));
+app.get("/", (c) => {
+  return c.text("Proxy is running", 200, withCors({ "Content-Type": "text/plain" }));
+});
 
-app.get("/hls", async (c) => {
+app.head("/", (c) => {
+  return new Response(null, {
+    status: 200,
+    headers: withCors(),
+  });
+});
+
+async function handleProxy(c) {
   const src = c.req.query("src");
 
-  if (!src || typeof src !== "string") {
-    return c.text("Missing src", 400, corsHeaders);
+  if (!src) {
+    return c.text("Missing src", 400, withCors());
   }
 
   if (!isAllowedTarget(src)) {
-    return c.text("Invalid or disallowed URL", 403, corsHeaders);
+    return c.text("Invalid or disallowed URL", 403, withCors());
   }
 
   let target;
   try {
     target = new URL(src);
   } catch {
-    return c.text("Invalid URL", 400, corsHeaders);
+    return c.text("Invalid URL", 400, withCors());
   }
 
   const pathname = target.pathname;
 
-  if (!isPlaylist(pathname) && !isSegmentLike(pathname)) {
-    return c.text("Unsupported media type", 400, corsHeaders);
+  if (!isLikelyMediaPath(pathname)) {
+    return c.text("Unsupported media type", 400, withCors());
   }
 
   try {
+    const requestHeaders = new Headers();
+
+    requestHeaders.set(
+      "User-Agent",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    );
+    requestHeaders.set(
+      "Accept",
+      "*/*"
+    );
+
+    const incomingRange = c.req.header("range");
+    if (incomingRange) requestHeaders.set("Range", incomingRange);
+
+    const incomingReferer = c.req.header("referer");
+    if (incomingReferer) requestHeaders.set("Referer", incomingReferer);
+
+    const incomingOrigin = c.req.header("origin");
+    if (incomingOrigin) requestHeaders.set("Origin", incomingOrigin);
+
     const upstream = await fetch(src, {
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        Accept: "*/*",
-      },
-      signal: AbortSignal.timeout(15000),
+      method: c.req.method === "HEAD" ? "HEAD" : "GET",
+      headers: requestHeaders,
+      redirect: "follow",
+      signal: AbortSignal.timeout(20000),
     });
 
+    const responseHeaders = new Headers();
+    Object.entries(CORS_HEADERS).forEach(([k, v]) => responseHeaders.set(k, v));
+    responseHeaders.set("Cache-Control", "no-store");
+
+    copyHeaderIfPresent(upstream.headers, responseHeaders, "content-type");
+    copyHeaderIfPresent(upstream.headers, responseHeaders, "content-length");
+    copyHeaderIfPresent(upstream.headers, responseHeaders, "content-range");
+    copyHeaderIfPresent(upstream.headers, responseHeaders, "accept-ranges");
+
+    const upstreamContentType =
+      upstream.headers.get("content-type")?.toLowerCase() || "";
+
+    const looksLikePlaylist =
+      isPlaylistPath(pathname) ||
+      upstreamContentType.includes("application/vnd.apple.mpegurl") ||
+      upstreamContentType.includes("application/x-mpegurl");
+
     if (!upstream.ok) {
-      return c.text("Upstream error", upstream.status, corsHeaders);
+      const errorText = await upstream.text().catch(() => "Upstream error");
+      console.error("Upstream failed:", upstream.status, src, errorText.slice(0, 500));
+
+      if (!responseHeaders.has("Content-Type")) {
+        responseHeaders.set("Content-Type", "text/plain; charset=utf-8");
+      }
+
+      return new Response(errorText || "Upstream error", {
+        status: upstream.status,
+        headers: responseHeaders,
+      });
     }
 
-    const headers = new Headers();
-    headers.set("Access-Control-Allow-Origin", "*");
-    headers.set("Access-Control-Allow-Methods", "GET, OPTIONS");
-    headers.set("Access-Control-Allow-Headers", "*");
-    headers.set("Cache-Control", "no-store");
-
-    if (isPlaylist(pathname)) {
-      const contentType =
-        upstream.headers.get("content-type") ||
-        "application/vnd.apple.mpegurl";
-      const text = await upstream.text();
-      const rewritten = rewriteM3U8(text, src, c.req);
-      headers.set("Content-Type", contentType);
-      return c.text(rewritten, 200, Object.fromEntries(headers.entries()));
+    if (c.req.method === "HEAD") {
+      return new Response(null, {
+        status: upstream.status,
+        headers: responseHeaders,
+      });
     }
 
-    const contentType =
-      upstream.headers.get("content-type") || "application/octet-stream";
-    headers.set("Content-Type", contentType);
+    if (looksLikePlaylist) {
+      const playlistText = await upstream.text();
+      const rewritten = rewriteM3U8(playlistText, src, c);
 
-    const contentLength = upstream.headers.get("content-length");
-    if (contentLength) {
-      headers.set("Content-Length", contentLength);
+      responseHeaders.set(
+        "Content-Type",
+        upstream.headers.get("content-type") || "application/vnd.apple.mpegurl"
+      );
+
+      return new Response(rewritten, {
+        status: 200,
+        headers: responseHeaders,
+      });
+    }
+
+    if (!responseHeaders.has("Content-Type")) {
+      responseHeaders.set("Content-Type", "application/octet-stream");
     }
 
     return new Response(upstream.body, {
-      status: 200,
-      headers,
+      status: upstream.status,
+      headers: responseHeaders,
     });
   } catch (err) {
-    console.error(err.message);
-    return c.text("Proxy failed", 500, corsHeaders);
-  }
-});
+    console.error("Proxy failed:", err);
 
-serve({ fetch: app.fetch, port: Number(PORT) }, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+    return c.json(
+      {
+        error: "Proxy failed",
+        details: err instanceof Error ? err.message : String(err),
+      },
+      500,
+      withCors({ "Content-Type": "application/json; charset=utf-8" })
+    );
+  }
+}
+
+app.get("/hls", handleProxy);
+app.head("/hls", handleProxy);
+
+serve(
+  {
+    fetch: app.fetch,
+    port: PORT,
+  },
+  () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  }
+);
