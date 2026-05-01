@@ -44,6 +44,12 @@ function isSegmentLike(pathname) {
     p.endsWith(".mp3") ||
     p.endsWith(".vtt") ||
     p.endsWith(".webvtt") ||
+    // Some hosts disguise segments as images
+    p.endsWith(".gif") ||
+    p.endsWith(".jpg") ||
+    p.endsWith(".jpeg") ||
+    p.endsWith(".png") ||
+    p.endsWith(".webp") ||
     p.endsWith(".key")
   );
 }
@@ -52,14 +58,23 @@ function isLikelyMediaPath(pathname) {
   return isPlaylistPath(pathname) || isSegmentLike(pathname);
 }
 
-// Force HTTPS in rewritten playlist URLs
 function makeProxyUrl(c, absoluteUrl) {
   const host =
     c.req.header("x-forwarded-host") ||
     c.req.header("host") ||
     new URL(c.req.url).host;
 
-  return `https://${host}/hls?src=${encodeURIComponent(absoluteUrl)}`;
+  // Prefer forwarded proto (e.g. behind nginx/vercel). Fall back to request URL.
+  // This keeps localhost working over http.
+  const proto =
+    c.req.header("x-forwarded-proto") ||
+    new URL(c.req.url).protocol.replace(":", "") ||
+    "http";
+
+  const ref = c.req.query("ref");
+  const refParam = ref ? `&ref=${encodeURIComponent(ref)}` : "";
+
+  return `${proto}://${host}/hls?src=${encodeURIComponent(absoluteUrl)}${refParam}`;
 }
 
 function rewriteM3U8(text, baseUrl, c) {
@@ -121,7 +136,7 @@ app.get("/", (c) => {
   );
 });
 
-app.head("/", (c) => {
+app.on("HEAD", "/", (c) => {
   return new Response(null, {
     status: 200,
     headers: withCors(),
@@ -161,14 +176,25 @@ async function handleProxy(c) {
     );
     requestHeaders.set("Accept", "*/*");
 
+    // Many HLS hosts block requests without an expected Referer/Origin.
+    // Prefer explicit `ref` query (from frontend), otherwise default to upstream origin.
+    const ref = c.req.query("ref") || "";
+    if (ref) {
+      requestHeaders.set("Referer", ref);
+      try {
+        requestHeaders.set("Origin", new URL(ref).origin);
+      } catch {
+        requestHeaders.set("Origin", target.origin);
+      }
+    } else {
+      requestHeaders.set("Origin", target.origin);
+      requestHeaders.set("Referer", `${target.origin}/`);
+    }
+
     const incomingRange = c.req.header("range");
     if (incomingRange) requestHeaders.set("Range", incomingRange);
 
-    const incomingReferer = c.req.header("referer");
-    if (incomingReferer) requestHeaders.set("Referer", incomingReferer);
-
-    const incomingOrigin = c.req.header("origin");
-    if (incomingOrigin) requestHeaders.set("Origin", incomingOrigin);
+    // Do not forward browser's localhost referer/origin by default.
 
     const upstream = await fetch(src, {
       method: c.req.method === "HEAD" ? "HEAD" : "GET",
@@ -196,7 +222,12 @@ async function handleProxy(c) {
 
     if (!upstream.ok) {
       const errorText = await upstream.text().catch(() => "Upstream error");
-      console.error("Upstream failed:", upstream.status, src, errorText.slice(0, 500));
+      console.error(
+        "Upstream failed:",
+        upstream.status,
+        src,
+        errorText.slice(0, 500)
+      );
 
       if (!responseHeaders.has("Content-Type")) {
         responseHeaders.set("Content-Type", "text/plain; charset=utf-8");
@@ -253,7 +284,7 @@ async function handleProxy(c) {
 }
 
 app.get("/hls", handleProxy);
-app.head("/hls", handleProxy);
+app.on("HEAD", "/hls", handleProxy);
 
 serve(
   {
